@@ -1,0 +1,4 @@
+prefix = "test"
+location = "eastus"
+admin_username = "xxxx"
+admin_password = "xxxxxxxxxx"
