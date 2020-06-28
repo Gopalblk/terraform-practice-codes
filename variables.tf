@@ -22,3 +22,12 @@ variable "admin_password" {
     type = "string"
     description = "Password must meet Azure complexity requirements"
 }
+variable "subnet_prefixes" {
+  type    = list(string)
+  default = ["10.0.2.0/24", "10.0.3.0/24"]
+}
+
+variable "subnet_names" {
+  type    = list(string)
+  default = ["web", "db"]
+}
