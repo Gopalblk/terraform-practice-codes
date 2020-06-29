@@ -1,0 +1,235 @@
+# Configure the Microsoft Azure Provider
+provider "azurerm" {
+    # The "feature" block is required for AzureRM provider 2.x.
+    # If you're using version 1.x, the "features" block is not allowed.
+    version = "~>2.0"
+    features {}
+}
+
+resource "azurerm_resource_group" "cli" {
+  count    = length(var.location)
+  name     = "rg-cli${count.index}"
+  location = element(var.location, count.index)
+}
+
+resource "azurerm_virtual_network" "cli" {
+  count               = length(var.location)
+  name                = "cli-vnet${count.index}"
+  resource_group_name = element(azurerm_resource_group.cli.*.name, count.index)
+  address_space       = [element(var.vnet_address_space, count.index)]
+  location            = element(azurerm_resource_group.cli.*.location, count.index)
+}
+
+resource "azurerm_subnet" "web" {
+  count                = length(var.location)
+  name                 = "websubnet${count.index}"
+  resource_group_name  = element(azurerm_resource_group.cli.*.name, count.index)
+  virtual_network_name = element(azurerm_virtual_network.cli.*.name, count.index)
+  address_prefix = cidrsubnet(
+    element(
+      azurerm_virtual_network.cli[count.index].address_space,
+      count.index,
+    ),
+    11,
+    15,
+  ) # /27
+}
+
+# enable global peering between the two virtual network
+resource "azurerm_virtual_network_peering" "peering" {
+  count                        = length(var.location)
+  name                         = "peering-to-${element(azurerm_virtual_network.cli.*.name, 1 - count.index)}"
+  resource_group_name          = element(azurerm_resource_group.cli.*.name, count.index)
+  virtual_network_name         = element(azurerm_virtual_network.cli.*.name, count.index)
+  remote_virtual_network_id    = element(azurerm_virtual_network.cli.*.id, 1 - count.index)
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+
+  # `allow_gateway_transit` must be set to false for vnet Global Peering
+  allow_gateway_transit = false
+}
+
+resource "azurerm_subnet" "db" {
+  count                = length(var.location)
+  name                 = "dbsubnet${count.index}"
+  resource_group_name  = element(azurerm_resource_group.cli.*.name, count.index)
+  virtual_network_name = element(azurerm_virtual_network.cli.*.name, count.index)
+  address_prefix = cidrsubnet(
+    element(
+      azurerm_virtual_network.cli[count.index].address_space,
+      count.index,
+    ),
+    11,
+    14,
+  ) # /27
+}
+
+# Create public IPs
+resource "azurerm_public_ip" "webpubip" {
+    count                        = 2
+    name                         = "webpubip${count.index}"
+    location                     = element(azurerm_resource_group.cli.*.location, count.index)
+    resource_group_name          = element(azurerm_resource_group.cli.*.name, count.index)
+    allocation_method            = "Dynamic"
+
+    tags = {
+        environment = "Terraform group"
+    }
+}
+
+resource "azurerm_public_ip" "dbpubip" {
+    count                        = 2
+    name                         = "dbpubip${count.index}"
+    location                     = element(azurerm_resource_group.cli.*.location, count.index)
+    resource_group_name          = element(azurerm_resource_group.cli.*.name, count.index)
+    allocation_method            = "Dynamic"
+
+    tags = {
+        environment = "Terraform group"
+    }
+}
+
+#Create Web NIC
+resource "azurerm_network_interface" "webnic" {
+  count                     = 2
+  name                      = "${var.prefix}webnic${count.index}"
+  location                  = element(azurerm_resource_group.cli.*.location, count.index)
+  resource_group_name       = element(azurerm_resource_group.cli.*.name, count.index)
+#  network_security_group_id = azurerm_network_security_group.nsg.id
+  #tags                      = var.tags
+
+  ip_configuration {
+    name                          = "${var.prefix}webniccfg"
+    subnet_id                     = "${azurerm_subnet.web[count.index].id}"
+    private_ip_address_allocation = "dynamic"
+    public_ip_address_id          = "${azurerm_public_ip.webpubip[count.index].id}"
+  }
+}
+
+#Create DB NIC
+resource "azurerm_network_interface" "dbnic" {
+  count                     = 2
+  name                      = "${var.prefix}dbnic${count.index}"
+  location                  = element(azurerm_resource_group.cli.*.location, count.index)
+  resource_group_name       = element(azurerm_resource_group.cli.*.name, count.index)
+#  network_security_group_id = azurerm_network_security_group.nsg.id
+  #tags                      = var.tags
+
+  ip_configuration {
+    name                          = "${var.prefix}dbniccfg"
+    subnet_id                     = "${azurerm_subnet.db[count.index].id}"
+    private_ip_address_allocation = "dynamic"
+    public_ip_address_id          = "${azurerm_public_ip.dbpubip[count.index].id}"
+  }
+}
+
+data "template_file" "cloudinit" {
+  template = "${file("nginx.txt")}"
+}
+
+# Create a Web Linux virtual machine
+resource "azurerm_virtual_machine" "webvm" {
+  count                 = 2
+  name                  = "${var.prefix}webvm${count.index}"
+  location              = element(azurerm_resource_group.cli.*.location, count.index)
+  resource_group_name   = element(azurerm_resource_group.cli.*.name, count.index)
+  network_interface_ids = [element(azurerm_network_interface.webnic.*.id, count.index)]
+  vm_size               = "Standard_DS1_v2"
+  #tags                  = var.tags
+
+  storage_os_disk {
+    name              = "${var.prefix}webosdisk${count.index}"
+    caching           = "ReadWrite"
+    create_option     = "FromImage"
+    managed_disk_type = "Premium_LRS"
+  }
+
+  storage_image_reference {
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       =  "18.04-LTS"
+    version   = "latest"
+  }
+
+  os_profile {
+    computer_name  = "${var.prefix}webvm${count.index}"
+    admin_username = var.admin_username
+    admin_password = var.admin_password
+    custom_data    = "${data.template_file.cloudinit.rendered}"
+  }
+
+  os_profile_linux_config {
+    disable_password_authentication = false
+  }
+}
+
+# Create a DB Linux virtual machine
+resource "azurerm_virtual_machine" "dbvm" {
+  count                 = 2
+  name                  = "${var.prefix}dbvm${count.index}"
+  location              = element(azurerm_resource_group.cli.*.location, count.index)
+  resource_group_name   = element(azurerm_resource_group.cli.*.name, count.index)
+  network_interface_ids = [element(azurerm_network_interface.dbnic.*.id, count.index)]
+  vm_size               = "Standard_DS1_v2"
+  #tags                  = var.tags
+
+  storage_os_disk {
+    name              = "${var.prefix}dbosdisk${count.index}"
+    caching           = "ReadWrite"
+    create_option     = "FromImage"
+    managed_disk_type = "Premium_LRS"
+  }
+
+  storage_image_reference {
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       =  "18.04-LTS"
+    version   = "latest"
+  }
+
+  os_profile {
+    computer_name  = "${var.prefix}dbvm${count.index}"
+    admin_username = var.admin_username
+    admin_password = var.admin_password
+  }
+
+  os_profile_linux_config {
+    disable_password_authentication = false
+  }
+}
+
+resource "azurerm_managed_disk" "webdata" {
+  count                =  2
+  name                 = "webdata${count.index}"
+  location             = element(azurerm_resource_group.cli.*.location, count.index)
+  create_option        = "Empty"
+  disk_size_gb         = 10
+  resource_group_name  = element(azurerm_resource_group.cli.*.name, count.index)
+  storage_account_type = "Standard_LRS"
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "webdata" {
+  count              = 2
+  managed_disk_id    = element(azurerm_managed_disk.webdata.*.id, count.index)
+  virtual_machine_id = "${azurerm_virtual_machine.webvm[count.index].id}"
+  lun                =  count.index + 1
+  caching            = "None"
+}
+
+resource "azurerm_managed_disk" "dbdata" {
+  count                =  2
+  name                 = "dbdata${count.index}"
+  location             = element(azurerm_resource_group.cli.*.location, count.index)
+  create_option        = "Empty"
+  disk_size_gb         = 10
+  resource_group_name  = element(azurerm_resource_group.cli.*.name, count.index)
+  storage_account_type = "Standard_LRS"
+}
+
+resource "azurerm_virtual_machine_data_disk_attachment" "dbdata" {
+  count              = 2
+  managed_disk_id    = element(azurerm_managed_disk.dbdata.*.id, count.index)
+  virtual_machine_id = "${azurerm_virtual_machine.dbvm[count.index].id}"
+  lun                =  count.index + 1
+  caching            = "None"
+}
